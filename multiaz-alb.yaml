@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  VPC:
+    Type: 'AWS::EC2::VPC'
+    Properties:
+      CidrBlock: 10.0.0.0/16
+  IGW:
+    Type: 'AWS::EC2::InternetGateway'
+  IGWVPCAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref IGW
+  SubnetAZ1Public:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: us-east-1a
+  SubnetAZ2Public:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: us-east-1b
+  SubnetAZ3Public:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: us-east-1c
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicRoute: 
+    Type: AWS::EC2::Route
+    DependsOn: 
+      - IGWVPCAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+  SubnetAZ1RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties: 
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref SubnetAZ1Public
+  SubnetAZ2RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties: 
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref SubnetAZ2Public
+  SubnetAZ3RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties: 
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref SubnetAZ3Public
+  AppLoadBalancerSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Loadbalancer Allowed Ports from the internet
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+      VpcId: !Ref VPC
+  AppLoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Scheme: 'internet-facing'
+      SecurityGroups:
+        - !Ref AppLoadBalancerSG
+      Subnets:
+        - !Ref SubnetAZ1Public
+        - !Ref SubnetAZ2Public
+        - !Ref SubnetAZ3Public
+  AppLoadBalancerTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      HealthCheckIntervalSeconds: 15
+      UnhealthyThresholdCount: 10
+      HealthCheckPath: /
+      Name: AppTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+  AppLoadBalancerHTTPListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppLoadBalancerTargetGroup
+      LoadBalancerArn: !Ref AppLoadBalancer
+      Port: 80
+      Protocol: HTTP 
+  App1FleetSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Limits ingress traffic from the ALB to application fleet 1
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref AppLoadBalancerSG
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+      VpcId: !Ref VPC
+  ASGLC:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      ImageId: ami-14c5486b
+      AssociatePublicIpAddress: true
+      InstanceType: t2.small
+      KeyName: id_rsa
+      SecurityGroups:
+        - !Ref App1FleetSG
+      UserData: !Base64 
+        'Fn::Sub': |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd24
+          service httpd start
+          chkconfig httpd on
+          groupadd www
+          usermod -a -G www ec2-user
+          chown -R root:www /var/www
+          chmod 2775 /var/www
+          find /var/www -type d -exec chmod 2775 {} +
+          find /var/www -type f -exec chmod 0664 {} +
+          instance_id=`curl http://169.254.169.254/latest/meta-data/instance-id`
+          hostname=`curl http://169.254.169.254/latest/meta-data/hostname`
+          az=`curl http://169.254.169.254/latest/meta-data/placement/availability-zone`
+
+          echo "<html><h2>Page came from:</h2><table><tr><td>Instance ID:</td><td>$instance_id</td></tr><tr><td>Hostname:</td><td>$hostname</td></tr><tr><td>AZ:</td><td>$az</td></tr></table></html>" > /var/www/html/index.html
+  ASG1:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    DependsOn:
+      - SubnetAZ1RouteTableAssociation
+      - SubnetAZ2RouteTableAssociation
+      - SubnetAZ3RouteTableAssociation
+    Properties:
+      AvailabilityZones:
+        - us-east-1a
+        - us-east-1b
+        - us-east-1c
+      VPCZoneIdentifier:
+      - !Ref SubnetAZ1Public
+      - !Ref SubnetAZ2Public
+      - !Ref SubnetAZ3Public
+      LaunchConfigurationName: !Ref ASGLC
+      MinSize: 0
+      DesiredCapacity: 3
+      MaxSize: 3
+      TargetGroupARNs:
+        - !Ref AppLoadBalancerTargetGroup
